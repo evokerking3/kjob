@@ -2,9 +2,14 @@
 
 import argparse
 import enum
+import os
 import sys
+import json
 import paramiko.client
-import icmplib
+from pathlib import Path
+
+# cryptography is used for encrypt/decrypt helpers
+from cryptography.fernet import Fernet
 
 
 class JobStatus(enum.Enum):
@@ -22,21 +27,108 @@ ssh_client: paramiko.client.SSHClient | None = None
 sftp_client: paramiko.SFTPClient | None = None
 
 
+# configuration directory and files for node storage
+
+CONFIG_DIR = Path.home() / ".kjob"
+KEY_FILE = CONFIG_DIR / "key.key"           # symmetric key for encryption
+NODES_FILE = CONFIG_DIR / "nodes.enc"       # encrypted JSON containing the node list
+
+
+def ensure_config_dir() -> None:
+    """Create the configuration directory and key file if they don't exist."""
+    CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
+    if not KEY_FILE.exists():
+        # generate a random key and save it with restrictive permissions
+        key = Fernet.generate_key()
+        with open(KEY_FILE, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)  # user read/write only
+            f.write(key)
+
+
+def load_key() -> bytes:
+    """Return the encryption key, generating one if necessary."""
+    ensure_config_dir()
+    return KEY_FILE.read_bytes()
+
+
+def encrypt_data(data: bytes) -> bytes:
+    """Encrypt *data* using the persisted key."""
+    key = load_key()
+    f = Fernet(key)
+    return f.encrypt(data)
+
+
+def decrypt_data(data: bytes) -> bytes:
+    """Decrypt *data* using the persisted key."""
+    key = load_key()
+    f = Fernet(key)
+    return f.decrypt(data)
+
+
+def load_nodes() -> dict[str, dict]:
+    """Load the node dictionary from the encrypted file.
+
+    Returns an empty dict if the file does not exist or cannot be
+    decrypted.
+    """
+    if not NODES_FILE.exists():
+        return {}
+    try:
+        enc = NODES_FILE.read_bytes()
+        raw = decrypt_data(enc)
+        return json.loads(raw)
+    except Exception:
+        # corrupted or invalid, ignore and start fresh
+        return {}
+
+
+def save_nodes(nodes: dict[str, dict]) -> None:
+    """Persist *nodes* to disk, encrypting the JSON representation."""
+    ensure_config_dir()
+    raw = json.dumps(nodes).encode("utf-8")
+    enc = encrypt_data(raw)
+    with open(NODES_FILE, "wb") as f:
+        os.fchmod(f.fileno(), 0o600)
+        f.write(enc)
+
 
 def handle_node_list() -> None:
     """List configured nodes."""
-    print("> listing nodes (not implemented)")
+    nodes = load_nodes()
+    if not nodes:
+        print("> no nodes configured")
+        return
+    print("> configured nodes:")
+    for name, info in nodes.items():
+        user = info.get("user")
+        host = info.get("host")
+        print(f"  {name}: {user}@{host}")
 
 
 def handle_node_add(user: str, host: str, name: str, password: str) -> None:
-    """Add a node entry identified by *name* with given *user* and *host*."""
-    print("> adding node")
-    print(f"  user: {user}, host: {host}, name: {name}")
+    """Add a node entry identified by *name* with given *user* and *host*.
+
+    The password is stored along with the node info and the complete
+    dictionary is encrypted on disk.
+    """
+    nodes = load_nodes()
+    if name in nodes:
+        print(f"> node '{name}' already exists")
+        return
+    nodes[name] = {"user": user, "host": host, "password": password}
+    save_nodes(nodes)
+    print(f"> added node '{name}'")
 
 
 def handle_node_remove(name: str) -> None:
     """Remove a node entry by *name*."""
-    print(f"> removing node {name}")
+    nodes = load_nodes()
+    if name in nodes:
+        del nodes[name]
+        save_nodes(nodes)
+        print(f"> removed node {name}")
+    else:
+        print(f"> node '{name}' not found")
 
 
 def parse_and_dispatch() -> None:
