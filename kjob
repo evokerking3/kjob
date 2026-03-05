@@ -7,6 +7,15 @@ import sys
 import json
 import paramiko.client
 from pathlib import Path
+import subprocess
+import threading
+import shutil
+
+# optional ping library, fallback if not installed
+try:
+    import icmplib
+except ImportError:
+    icmplib = None
 
 # cryptography is used for encrypt/decrypt helpers
 from cryptography.fernet import Fernet
@@ -22,113 +31,153 @@ class TextPos(enum.Enum):
     Left = "left"
     Right = "right"
 
+
+class NodeStore:
+    """Encapsulate node configuration storage and utilities.
+
+    The previous module-level functions and globals have been moved into
+    this object so that state is contained and tests can exercise it more
+    easily.  A single global instance is created below which the CLI
+    handlers delegate to.
+    """
+
+    def __init__(self):
+        self.config_dir = Path.home() / ".kjob"
+        self.key_file = self.config_dir / "key.key"
+        self.nodes_file = self.config_dir / "nodes.enc"
+        self._ensure_config_dir()
+
+    def _ensure_config_dir(self) -> None:
+        self.config_dir.mkdir(mode=0o700, exist_ok=True)
+        if not self.key_file.exists():
+            key = Fernet.generate_key()
+            with open(self.key_file, "wb") as f:
+                os.fchmod(f.fileno(), 0o600)
+                f.write(key)
+
+    def _load_key(self) -> bytes:
+        self._ensure_config_dir()
+        return self.key_file.read_bytes()
+
+    def _encrypt(self, data: bytes) -> bytes:
+        f = Fernet(self._load_key())
+        return f.encrypt(data)
+
+    def _decrypt(self, data: bytes) -> bytes:
+        f = Fernet(self._load_key())
+        return f.decrypt(data)
+
+    def load(self) -> dict[str, dict]:
+        """Return the current node dictionary, or empty if none stored."""
+        if not self.nodes_file.exists():
+            return {}
+        try:
+            enc = self.nodes_file.read_bytes()
+            raw = self._decrypt(enc)
+            return json.loads(raw)
+        except Exception:
+            return {}
+
+    def save(self, nodes: dict[str, dict]) -> None:
+        """Write the node dictionary, encrypting it first."""
+        self._ensure_config_dir()
+        raw = json.dumps(nodes).encode("utf-8")
+        enc = self._encrypt(raw)
+        with open(self.nodes_file, "wb") as f:
+            os.fchmod(f.fileno(), 0o600)
+            f.write(enc)
+
+    @staticmethod
+    def ping_host(host: str, timeout: int = 5) -> bool:
+        if icmplib is not None:
+            try:
+                res = icmplib.ping(host, count=1, timeout=timeout)
+                return res.is_alive
+            except Exception:
+                return False
+        ping_cmd = shutil.which("ping")
+        if ping_cmd is None:
+            print("> ping utility not found; cannot verify host reachability")
+            return False
+        try:
+            subprocess.run(
+                [ping_cmd, "-c", "1", "-W", str(int(timeout)), host],
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except subprocess.CalledProcessError:
+            return False
+
+    @classmethod
+    def ping_with_animation(cls, host: str) -> bool:
+        result: dict[str, bool] = {"success": False}
+
+        def do_ping() -> None:
+            result["success"] = cls.ping_host(host)
+
+        t = threading.Thread(target=do_ping)
+        t.start()
+        while t.is_alive():
+            bouncing_dots_animation(duration_seconds=0.5, message="Pinging Node", pos=TextPos.Left)
+        t.join()
+        return result["success"]
+
+    def list(self) -> None:
+        nodes = self.load()
+        if not nodes:
+            print("> no nodes configured")
+            return
+        print("> configured nodes:")
+        for name, info in nodes.items():
+            user = info.get("user")
+            host = info.get("host")
+            print(f"  {name}: {user}@{host}")
+
+    def add(self, user: str, host: str, name: str, password: str) -> bool:
+        print("> pinging node to verify connectivity")
+        if not self.ping_with_animation(host):
+            print(f"> unable to reach host {host}, aborting")
+            return False
+        nodes = self.load()
+        if name in nodes:
+            print(f"> node '{name}' already exists")
+            return False
+        nodes[name] = {"user": user, "host": host, "password": password}
+        self.save(nodes)
+        print(f"> added node '{name}' with credentials {user}@{host} and password {'*' * len(password)}")
+        return True
+
+    def remove(self, name: str) -> bool:
+        nodes = self.load()
+        if name in nodes:
+            del nodes[name]
+            self.save(nodes)
+            print(f"> removed node {name}")
+            return True
+        else:
+            print(f"> node '{name}' not found")
+            return False
+
+
+# singleton instance used by handlers
+node_store = NodeStore()
+
 # singletons for SSH/SFTP clients
 ssh_client: paramiko.client.SSHClient | None = None
 sftp_client: paramiko.SFTPClient | None = None
 
 
-# configuration directory and files for node storage
-
-CONFIG_DIR = Path.home() / ".kjob"
-KEY_FILE = CONFIG_DIR / "key.key"           # symmetric key for encryption
-NODES_FILE = CONFIG_DIR / "nodes.enc"       # encrypted JSON containing the node list
-
-
-def ensure_config_dir() -> None:
-    """Create the configuration directory and key file if they don't exist."""
-    CONFIG_DIR.mkdir(mode=0o700, exist_ok=True)
-    if not KEY_FILE.exists():
-        # generate a random key and save it with restrictive permissions
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as f:
-            os.fchmod(f.fileno(), 0o600)  # user read/write only
-            f.write(key)
-
-
-def load_key() -> bytes:
-    """Return the encryption key, generating one if necessary."""
-    ensure_config_dir()
-    return KEY_FILE.read_bytes()
-
-
-def encrypt_data(data: bytes) -> bytes:
-    """Encrypt *data* using the persisted key."""
-    key = load_key()
-    f = Fernet(key)
-    return f.encrypt(data)
-
-
-def decrypt_data(data: bytes) -> bytes:
-    """Decrypt *data* using the persisted key."""
-    key = load_key()
-    f = Fernet(key)
-    return f.decrypt(data)
-
-
-def load_nodes() -> dict[str, dict]:
-    """Load the node dictionary from the encrypted file.
-
-    Returns an empty dict if the file does not exist or cannot be
-    decrypted.
-    """
-    if not NODES_FILE.exists():
-        return {}
-    try:
-        enc = NODES_FILE.read_bytes()
-        raw = decrypt_data(enc)
-        return json.loads(raw)
-    except Exception:
-        # corrupted or invalid, ignore and start fresh
-        return {}
-
-
-def save_nodes(nodes: dict[str, dict]) -> None:
-    """Persist *nodes* to disk, encrypting the JSON representation."""
-    ensure_config_dir()
-    raw = json.dumps(nodes).encode("utf-8")
-    enc = encrypt_data(raw)
-    with open(NODES_FILE, "wb") as f:
-        os.fchmod(f.fileno(), 0o600)
-        f.write(enc)
-
-
-def handle_node_list() -> None:
-    """List configured nodes."""
-    nodes = load_nodes()
-    if not nodes:
-        print("> no nodes configured")
-        return
-    print("> configured nodes:")
-    for name, info in nodes.items():
-        user = info.get("user")
-        host = info.get("host")
-        print(f"  {name}: {user}@{host}")
 
 
 def handle_node_add(user: str, host: str, name: str, password: str) -> None:
-    """Add a node entry identified by *name* with given *user* and *host*.
-
-    The password is stored along with the node info and the complete
-    dictionary is encrypted on disk.
-    """
-    nodes = load_nodes()
-    if name in nodes:
-        print(f"> node '{name}' already exists")
-        return
-    nodes[name] = {"user": user, "host": host, "password": password}
-    save_nodes(nodes)
-    print(f"> added node '{name}'")
-
+    """Delegate node addition to the NodeStore."""
+    node_store.add(user, host, name, password)
 
 def handle_node_remove(name: str) -> None:
-    """Remove a node entry by *name*."""
-    nodes = load_nodes()
-    if name in nodes:
-        del nodes[name]
-        save_nodes(nodes)
-        print(f"> removed node {name}")
-    else:
-        print(f"> node '{name}' not found")
+    """Delegate node removal to the NodeStore."""
+    node_store.remove(name)
 
 
 def parse_and_dispatch() -> None:
@@ -160,9 +209,10 @@ def parse_and_dispatch() -> None:
         remove_parser = sub.add_parser("remove", help="remove an existing node")
         remove_parser.add_argument("name", help="name of the node to remove")
 
+
         # if no action is supplied we just list nodes
         if not node_args:
-            handle_node_list()
+            node_store.list()
             return
 
         parsed = node_parser.parse_args(node_args)
@@ -172,7 +222,7 @@ def parse_and_dispatch() -> None:
             handle_node_remove(parsed.name)
         else:
             # listing was already handled above but include fallback
-            handle_node_list()
+            node_store.list()
         return
 
     # otherwise we treat the invocation as a job submission
