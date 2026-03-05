@@ -1,3 +1,4 @@
 paramiko
 cryptography
 icmplib
+py7zr
