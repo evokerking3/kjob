@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+
+import argparse
+import enum
+import sys
+import paramiko.client
+import icmplib
+
+
+class JobStatus(enum.Enum):
+    PENDING = "pending"
+    RUNNING = "running"
+    COMPLETED = "completed"
+    FAILED = "failed"
+
+class TextPos(enum.Enum):
+    Left = "left"
+    Right = "right"
+
+# singletons for SSH/SFTP clients
+ssh_client: paramiko.client.SSHClient | None = None
+sftp_client: paramiko.SFTPClient | None = None
+
+
+
+def handle_node_list() -> None:
+    """List configured nodes."""
+    print("> listing nodes (not implemented)")
+
+
+def handle_node_add(user: str, host: str, name: str, password: str) -> None:
+    """Add a node entry identified by *name* with given *user* and *host*."""
+    print("> adding node")
+    print(f"  user: {user}, host: {host}, name: {name}")
+
+
+def handle_node_remove(name: str) -> None:
+    """Remove a node entry by *name*."""
+    print(f"> removing node {name}")
+
+
+def parse_and_dispatch() -> None:
+    """Parse command-line arguments and dispatch to the appropriate handler.
+
+    The command structure is:
+
+        kjob <file/folder> <main script> [-n <node-name>]
+        kjob node [add <user> <host> <name> | remove <name>]
+
+    Calling without any arguments prints the help text.
+    """
+    # Special-case the "node" subcommand because the top-level invocation
+    # does not use a named subparser for jobs.
+    if len(sys.argv) > 1 and sys.argv[1] == "node":
+        # consume the "node" token and parse the remainder
+        node_args = sys.argv[2:]
+        node_parser = argparse.ArgumentParser(
+            prog="kjob node",
+            description="Manage nodes used for distributed execution",
+        )
+        sub = node_parser.add_subparsers(dest="action")
+        add_parser = sub.add_parser("add", help="add a new node")
+        add_parser.add_argument("user", help="username to use for SSH")
+        add_parser.add_argument("host", help="hostname or IP of the node")
+        add_parser.add_argument("password", help="password for SSH and SFTP authentication")
+        add_parser.add_argument("name", help="short name for the node")
+
+        remove_parser = sub.add_parser("remove", help="remove an existing node")
+        remove_parser.add_argument("name", help="name of the node to remove")
+
+        # if no action is supplied we just list nodes
+        if not node_args:
+            handle_node_list()
+            return
+
+        parsed = node_parser.parse_args(node_args)
+        if parsed.action == "add":
+            handle_node_add(parsed.user, parsed.host, parsed.name, parsed.password)
+        elif parsed.action == "remove":
+            handle_node_remove(parsed.name)
+        else:
+            # listing was already handled above but include fallback
+            handle_node_list()
+        return
+
+    # otherwise we treat the invocation as a job submission
+    parser = argparse.ArgumentParser(
+        description="The poor mans version of distributed computing",
+        usage="kjob <file/folder> <main script> [-n <node-name>]",
+    )
+    parser.add_argument("file_or_folder", help="Path to script or folder containing job")
+    parser.add_argument("main_script", help="Name of the main script inside the folder")
+    parser.add_argument(
+        "-n",
+        "--node",
+        dest="node_name",
+        help="(optional) name of the node to run on",
+    )
+
+    # we don't need to create a client here yet; the handlers can request
+    # it lazily via get_client().
+    args = parser.parse_args()
+    handle_job(args.file_or_folder, args.main_script, args.node_name)
+
+
+
+def get_client() -> paramiko.client.SSHClient:
+    """Return a global SSH client instance, creating it on first use.
+
+    The client is cached in the module so that subsequent calls return the
+    same object (singleton pattern).  This makes it easier to manage
+    connections and reuse sockets.
+    """
+    global ssh_client
+    if ssh_client is None:
+        ssh_client = paramiko.client.SSHClient()
+        # configuration such as missing host key policies could go here
+    return ssh_client
+
+def get_sftp_client(client: paramiko.SSHClient | None = None) -> paramiko.SFTPClient:
+    """Return a shared SFTP client instance.
+
+    The SFTP client is created once and stored in ``sftp_client``.  If an
+    SSH client is supplied it will be used; otherwise the singleton SSH
+    client from :func:`get_client` will be obtained lazily.
+    """
+    global sftp_client
+    if sftp_client is None:
+        if client is None:
+            client = get_client()
+        sftp_client = client.open_sftp()
+    return sftp_client
+
+
+
+
+def progress_bar(current: int, total: int, width: int = 40, message: str = "Working", pos:TextPos = TextPos.Right) -> None:
+    """Display a progress bar."""
+    percent = current / total
+    filled = int(width * percent)
+    bar = "█" * filled + "░" * (width - filled)
+
+    if pos == TextPos.Right:
+        sys.stdout.write(f"\r{message} [{bar}] {percent * 100:.1f}%")
+    else:
+        sys.stdout.write(f"\r[{bar}] {percent * 100:.1f}% {message}")
+    sys.stdout.flush()
+
+def bouncing_dots_animation(duration_seconds: float = 5, message: str = "Loading...", pos: TextPos = TextPos.Right) -> None:
+    import time
+    """Show bouncing dots animation for a period of time."""
+    dots_positions = [
+        "●     ",
+        " ●    ",
+        "  ●   ",
+        "   ●  ",
+        "    ● ",
+        "     ●",
+        "    ● ",
+        "   ●  ",
+        "  ●   ",
+        " ●    ",
+    ]
+    
+    start = time.time()
+    frame = 0
+    
+    while time.time() - start < duration_seconds:
+        if pos == TextPos.Left:
+            sys.stdout.write(f"\r{message} [{dots_positions[frame % len(dots_positions)]}]")
+        else:
+            sys.stdout.write(f"\r[{dots_positions[frame % len(dots_positions)]}] {message}")
+        sys.stdout.flush()
+        frame += 1
+        time.sleep(0.1)
+    
+    sys.stdout.write(f"\r")  # Clear the line
+    sys.stdout.flush()
+
+def transition_animation(total_steps: int, message: str, pos: TextPos) -> None:
+    import time
+    """Transition from bouncing dots to progress bar."""
+    # Phase 1: Bouncing dots for initial indeterminate progress
+    bouncing_dots_animation(duration_seconds=3, message=message, pos=pos)
+    
+    # Phase 2: Progress bar when you know the total
+    for i in range(total_steps + 1):
+        progress_bar(i, total_steps, message=message, pos=pos)
+        time.sleep(0.1)
+    
+    print()  # New line when done
+
+
+
+def handle_job(file_or_folder: str, main_script: str, node_name: str | None) -> None:
+    """Execute a job located in *file_or_folder* using *main_script*.
+
+    Currently this is a stub that simply prints the parsed values.  The
+    real implementation should perform the distributed execution logic.
+    """
+    print("> Requesting Job")
+    print(f"  Sending: {file_or_folder}")
+    print(f"  And executing: {main_script}")
+    if node_name:
+        print(f"  Selected Node: {node_name}")
+
+    bouncing_dots_animation(duration_seconds=5, message="Pinging Node", pos=TextPos.Left)
+    
+    
+
+    client_ssh = get_client()
+    
+    client_ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    client_sftp = get_sftp_client(client=client_ssh)
+
+if __name__ == "__main__":
+    parse_and_dispatch()
