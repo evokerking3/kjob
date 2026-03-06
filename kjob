@@ -7,9 +7,7 @@ import sys
 import json
 import paramiko.client
 from pathlib import Path
-import subprocess
 import threading
-import shutil
 
 # optional ping library, fallback if not installed
 try:
@@ -19,13 +17,6 @@ except ImportError:
 
 # cryptography is used for encrypt/decrypt helpers
 from cryptography.fernet import Fernet
-
-
-class JobStatus(enum.Enum):
-    PENDING = "pending"
-    RUNNING = "running"
-    COMPLETED = "completed"
-    FAILED = "failed"
 
 class TextPos(enum.Enum):
     Left = "left"
@@ -95,21 +86,7 @@ class NodeStore:
                 return res.is_alive
             except Exception:
                 return False
-        ping_cmd = shutil.which("ping")
-        if ping_cmd is None:
-            print("> ping utility not found; cannot verify host reachability")
-            return False
-        try:
-            subprocess.run(
-                [ping_cmd, "-c", "1", "-W", str(int(timeout)), host],
-                check=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            return True
-        except subprocess.CalledProcessError:
-            return False
-
+        
     @classmethod
     def ping_with_animation(cls, host: str) -> bool:
         result: dict[str, bool] = {"success": False}
