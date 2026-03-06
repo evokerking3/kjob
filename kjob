@@ -10,10 +10,7 @@ from pathlib import Path
 import threading
 
 # optional ping library, fallback if not installed
-try:
-    import icmplib
-except ImportError:
-    icmplib = None
+import icmplib
 
 # cryptography is used for encrypt/decrypt helpers
 from cryptography.fernet import Fernet
